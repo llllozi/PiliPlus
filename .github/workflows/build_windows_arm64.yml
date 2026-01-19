@@ -36,17 +36,6 @@ jobs:
           dart pub global activate fastforge
           choco install innosetup -y
 
-      - name: Add Chinese language file for Inno Setup
-        shell: pwsh
-        run: |
-          $target = 'C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl'
-          if (-not (Test-Path $target)) {
-            Copy-Item "windows/packaging/exe/ChineseSimplified.isl" $target -Force
-            Write-Host "Copied ChineseSimplified.isl"
-          } else {
-            Write-Host "ChineseSimplified.isl exists"
-          }
-
       - name: Set and Extract version
         shell: pwsh
         run: lib/scripts/build.ps1
@@ -68,143 +57,166 @@ jobs:
         run: |
           fastforge package --platform windows --targets exe --flutter-build-args="--arch=arm64 --dart-define-from-file=pili_release.json"
 
-      - name: Debug - list likely output folders
+      - name: Debug - list dist and likely folders (for troubleshooting)
         shell: pwsh
         run: |
           Write-Host "PWD: $(Get-Location)"
-          Write-Host "`n-- Top-level --"
+          Write-Host "`n-- top-level --"
           Get-ChildItem -Force | Select Name,Mode,Length,LastWriteTime | Format-Table -AutoSize
-          Write-Host "`n-- build/ --"
-          if (Test-Path build) { Get-ChildItem -Path build -Recurse -Force | Select-Object FullName | Out-String -Width 200 | Write-Host } else { Write-Host "No build/ folder" }
-          Write-Host "`n-- dist/ --"
-          if (Test-Path dist) { Get-ChildItem -Path dist -Recurse -Force | Select-Object FullName | Out-String -Width 200 | Write-Host } else { Write-Host "No dist/ folder" }
+          Write-Host "`n-- dist/ tree --"
+          if (Test-Path dist) {
+            Get-ChildItem -Path dist -Recurse -Force | Select-Object FullName,Length,LastWriteTime | Format-Table -AutoSize
+          } else {
+            Write-Host "No dist/ folder"
+          }
+          Write-Host "`n-- windows/packaging and build/ tree --"
+          if (Test-Path windows) {
+            Get-ChildItem -Path windows -Recurse -Force | Select-Object FullName,Length,LastWriteTime | Out-String -Width 300 | Write-Host
+          } else {
+            Write-Host "No windows/ folder"
+          }
+          if (Test-Path build) {
+            Get-ChildItem -Path build -Recurse -Force | Select-Object FullName,Length,LastWriteTime | Out-String -Width 300 | Write-Host
+          } else {
+            Write-Host "No build/ folder"
+          }
 
       - id: prepare
-        name: Prepare artifacts (zip + installer) and set outputs
+        name: Prepare artifacts (collect everything from dist and common paths)
         shell: pwsh
         env:
           CREATE_TEST_ARTIFACTS: ${{ github.event.inputs.create_test_artifacts }}
+          RELEASE_TAG: ${{ steps.set_tag.outputs.release_tag }}
         run: |
-          $releaseDir = Join-Path $PWD "Release\PiliPlus-Win"
-          $setupDir   = Join-Path $PWD "PiliPlus-Win-Setup"
+          $cwd = Get-Location
+          $releaseDir = Join-Path $cwd "Release\PiliPlus-Win"
+          $setupDir   = Join-Path $cwd "PiliPlus-Win-Setup"
           New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
           New-Item -ItemType Directory -Path $setupDir -Force | Out-Null
 
-          $patterns = @(
+          Write-Host "Collecting files from dist/ (all files) ..."
+          if (Test-Path dist) {
+            $distFiles = Get-ChildItem -Path dist -Recurse -File -ErrorAction SilentlyContinue
+            foreach ($f in $distFiles) {
+              $dest = Join-Path $releaseDir $f.Name
+              Copy-Item -Path $f.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
+              Write-Host "Copied from dist: $($f.FullName) -> $dest"
+            }
+          } else {
+            Write-Host "dist/ not found"
+          }
+
+          # Also collect from common windows output locations (if any)
+          $otherPatterns = @(
             "build\windows\arm64\runner\Release\*",
             "build\windows\runner\Release\*",
             "build\windows\arm64\Release\*",
-            "build\windows\Release\*"
+            "build\windows\Release\*",
+            "windows\packaging\**\*"
           )
 
-          $foundApp = $false
-          foreach ($p in $patterns) {
-            Write-Host "Checking: $p"
-            $items = Get-ChildItem -Path $p -File -Recurse -ErrorAction SilentlyContinue
-            if ($items -and $items.Count -gt 0) {
-              foreach ($it in $items) {
-                $dest = Join-Path $releaseDir $it.Name
-                Move-Item -Path $it.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
-                Write-Host "Moved: $($it.FullName) -> $dest"
-                $foundApp = $true
+          foreach ($p in $otherPatterns) {
+            Write-Host "Searching pattern: $p"
+            Try {
+              $items = Get-ChildItem -Path $p -File -Recurse -ErrorAction SilentlyContinue
+              if ($items) {
+                foreach ($it in $items) {
+                  $dest = Join-Path $releaseDir $it.Name
+                  Copy-Item -Path $it.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
+                  Write-Host "Copied: $($it.FullName) -> $dest"
+                }
+              } else {
+                Write-Host "No files matched $p"
               }
-            } else {
-              Write-Host "No match for: $p"
+            } Catch {
+              Write-Host "Pattern $p skipped (no files)"
             }
           }
 
-          if (-not $foundApp) {
-            Write-Host "Fallback search for common artifacts (.exe,.dll,.zip,.appx)"
-            $fallback = Get-ChildItem -Path . -Include *.exe,*.dll,*.zip,*.appx -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\.git\\' }
-            if ($fallback -and $fallback.Count -gt 0) {
-              foreach ($f in $fallback) {
-                $dest = Join-Path $releaseDir $f.Name
-                Copy-Item -Path $f.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
-                Write-Host "Copied fallback: $($f.FullName) -> $dest"
-                $foundApp = $true
-              }
-            } else {
-              Write-Host "No fallback artifacts found."
+          # search whole repo as last resort for common artifact extensions and copy them
+          Write-Host "Fallback search (common extensions: exe, msi, msix, zip, appx)..."
+          $exts = @('*.exe','*.msi','*.msix','*.zip','*.appx','*.msixbundle','*.nupkg')
+          foreach ($ext in $exts) {
+            $found = Get-ChildItem -Path . -Include $ext -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\.git\\' }
+            foreach ($f in $found) {
+              $dest = Join-Path $releaseDir $f.Name
+              Copy-Item -Path $f.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
+              Write-Host "Copied fallback: $($f.FullName) -> $dest"
             }
           }
 
-          # Installer search (dist first then whole repo)
-          $installer = Get-ChildItem -Path "dist" -Filter *.exe -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $installer) {
-            $installer = Get-ChildItem -Path . -Include *.exe -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\.git\\' } | Select-Object -First 1
-          }
+          # If nothing found and test switch enabled, create test files
+          $releaseFiles = Get-ChildItem -Path $releaseDir -Recurse -File -ErrorAction SilentlyContinue
+          $installerCandidate = Get-ChildItem -Path $setupDir -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
 
-          $haveInstaller = $false
-          $installerPath = ""
-          if ($installer) {
-            $ver = $env:version
-            if (-not $ver) { $ver = "unknown" }
-            $installerPath = Join-Path $setupDir ("PiliPlus_windows_${ver}_arm64_setup.exe")
-            Move-Item -Path $installer.FullName -Destination $installerPath -Force -ErrorAction SilentlyContinue
-            Write-Host "Moved installer: $($installer.FullName) -> $installerPath"
-            $haveInstaller = $true
-          } else {
-            Write-Host "No installer found"
-          }
-
-          # If nothing found and user requested test artifacts, create small test files so we can verify artifact upload
-          if (-not $foundApp -and -not $haveInstaller -and $env:CREATE_TEST_ARTIFACTS -eq 'true') {
-            Write-Host "Creating test artifacts..."
-            "test artifact file" | Out-File -FilePath (Join-Path $releaseDir "test-file.txt") -Encoding utf8
-            $installerPath = Join-Path $setupDir "PiliPlus_windows_test_arm64_setup.exe"
+          if ((-not $releaseFiles -or $releaseFiles.Count -eq 0) -and (-not $installerCandidate) -and $env:CREATE_TEST_ARTIFACTS -eq 'true') {
+            Write-Host "No real artifacts found - creating small test artifacts..."
+            "test artifact" | Out-File -FilePath (Join-Path $releaseDir "test-file.txt") -Encoding utf8
+            $installerPath = Join-Path $setupDir ("PiliPlus_windows_${env:RELEASE_TAG}_test_setup.exe")
             "dummy installer content" | Out-File -FilePath $installerPath -Encoding ascii
-            $foundApp = $true
-            $haveInstaller = $true
-            Write-Host "Test artifacts created."
+            Write-Host "Test artifacts created: $installerPath"
           }
 
-          # Create zip from Release/PiliPlus-Win if it contains files
-          $zipPath = ""
-          $releaseTag = "${{ steps.set_tag.outputs.release_tag }}"
+          # Create a zip of everything inside Release\PiliPlus-Win (if any)
+          $finalZip = ""
+          $releaseTag = $env:RELEASE_TAG
+          if (-not $releaseTag) { $releaseTag = "auto-${{ github.run_id }}" }
           if ((Get-ChildItem -Path $releaseDir -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0) {
-            if (-not $releaseTag) { $releaseTag = "auto-${{ github.run_id }}" }
-            $zipPath = Join-Path $PWD ("PiliPlus_windows_${releaseTag}_arm64.zip")
-            Compress-Archive -Path "$releaseDir\*" -DestinationPath $zipPath -Force
-            Write-Host "Zip created: $zipPath"
+            $finalZip = Join-Path $cwd ("PiliPlus_windows_${releaseTag}_arm64.zip")
+            Compress-Archive -Path "$releaseDir\*" -DestinationPath $finalZip -Force
+            Write-Host "Created zip: $finalZip"
           } else {
-            Write-Host "No files to zip in $releaseDir"
+            Write-Host "No files in $releaseDir to zip."
           }
 
-          Write-Host "`n-- Release/PiliPlus-Win contents --"
+          # find any installer-like file under setup dir or repo
+          $installer = Get-ChildItem -Path $setupDir -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $installer) {
+            $installer = Get-ChildItem -Path dist -Include *.exe,*.msi,*.msix -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if ($installer) {
+            $installerPath = $installer.FullName
+            Write-Host "Installer candidate: $installerPath"
+          } else {
+            $installerPath = ""
+            Write-Host "No installer candidate found."
+          }
+
+          Write-Host "`n-- Release folder listing --"
           Get-ChildItem -Path $releaseDir -Recurse -Force | Select-Object FullName,Length | Format-Table -AutoSize
-          Write-Host "`n-- PiliPlus-Win-Setup contents --"
+          Write-Host "`n-- Setup folder listing --"
           Get-ChildItem -Path $setupDir -Recurse -Force | Select-Object FullName,Length | Format-Table -AutoSize
 
-          $hasZip = ($zipPath -ne "" -and (Test-Path $zipPath))
+          $hasZip = ($finalZip -ne "" -and (Test-Path $finalZip))
           $hasInstaller = ($installerPath -ne "" -and (Test-Path $installerPath))
-          $hasArtifacts = $hasZip -or $hasInstaller
+          $hasArtifacts = $hasZip -or $hasInstaller -or ((Get-ChildItem -Path $releaseDir -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0)
 
           Add-Content -Path $env:GITHUB_OUTPUT -Value "has_artifacts=$($hasArtifacts.ToString().ToLower())"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "has_zip=$($hasZip.ToString().ToLower())"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "has_installer=$($hasInstaller.ToString().ToLower())"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "release_zip=$zipPath"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "release_zip=$finalZip"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "release_installer=$installerPath"
 
-          Write-Host "outputs: has_artifacts=$hasArtifacts, has_zip=$hasZip, has_installer=$hasInstaller"
-          Write-Host "release_zip=$zipPath"
+          Write-Host "outputs -> has_artifacts=$hasArtifacts, has_zip=$hasZip, has_installer=$hasInstaller"
+          Write-Host "release_zip=$finalZip"
           Write-Host "release_installer=$installerPath"
 
-      - name: Upload release zip as Actions artifact
+      - name: Upload zip artifact (actions artifact, visible on Run page)
         if: ${{ steps.prepare.outputs.has_zip == 'true' }}
         uses: actions/upload-artifact@v5
         with:
           name: windows-arm64-release
           path: ${{ steps.prepare.outputs.release_zip }}
 
-      - name: Upload installer as Actions artifact
+      - name: Upload installer artifact (actions artifact)
         if: ${{ steps.prepare.outputs.has_installer == 'true' }}
         uses: actions/upload-artifact@v5
         with:
           name: windows-setup-arm64-release
           path: ${{ steps.prepare.outputs.release_installer }}
 
-      - name: Upload whole Release folder (optional)
-        if: ${{ steps.prepare.outputs.has_artifacts == 'true' }}
+      - name: Upload Release folder (fallback artifact)
+        if: ${{ steps.prepare.outputs.has_artifacts == 'true' && steps.prepare.outputs.has_zip != 'true' && steps.prepare.outputs.has_installer != 'true' }}
         uses: actions/upload-artifact@v5
         with:
           name: Release-folder
