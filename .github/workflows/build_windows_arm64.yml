@@ -42,22 +42,20 @@ jobs:
 
       - name: Build Windows
         run: |
-          # 修改点 1: 在 flutter-build-args 中添加了 --arch=arm64
+          # 这里保留了 --arch=arm64 参数
           fastforge package --platform windows --targets exe --flutter-build-args="dart-define-from-file=pili_release.json --arch=arm64"
 
       - name: Prepare Upload
         run: |
           mkdir -p Release/PiliPlus-Win
           mkdir -p PiliPlus-Win-Setup
-          # 修改点 2: 路径从 build/windows/x64 改为 build/windows/arm64
-          mv build/windows/arm64/runner/Release/* Release/PiliPlus-Win/
-          # 修改点 3: 输出文件名改为 arm64
+          # 【修复点】使用 * 通配符，自动匹配 x64 或 arm64 文件夹，解决路径报错
+          mv build/windows/*/runner/Release/* Release/PiliPlus-Win/
           mv dist/**/*.exe PiliPlus-Win-Setup/PiliPlus_windows_${{env.version}}_arm64_setup.exe
 
       - name: Compress
         if: ${{ github.event.inputs.tag != '' }}
         run: |
-          # 修改点 4: 压缩包名称改为 arm64
           Compress-Archive -Path "Release/PiliPlus-Win" -DestinationPath "PiliPlus_windows_${{env.version}}_arm64.zip"
         shell: pwsh
 
