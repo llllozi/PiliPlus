@@ -1,69 +1,84 @@
 name: Build for Windows arm64
 
 on:
-  workflow_dispatch:
   workflow_call:
+    inputs:
+      tag:
+        description: "tag"
+        required: false
+        default: ""
+        type: string
+  workflow_dispatch:
 
 jobs:
-  build-windows-app:
+  build-windows-app-arm64:
     name: Release Windows arm64
     runs-on: windows-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      # 强制使用支持 ARM64 的新版 Flutter
       - name: Setup flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: '3.27.1'
+          flutter-version-file: pubspec.yaml
 
-      # 【修正点】只开启 Desktop 支持，不要再运行 enable-windows-arm64 (新版已废弃该命令)
-      - name: Enable Windows Desktop support
+      - name: Add fastforge and Inno Setup
         run: |
-          flutter config --enable-windows-desktop
-        shell: pwsh
-
-      - name: Install dependencies
-        run: flutter pub get
-
-      - name: Add Inno Setup
-        run: choco install innosetup
+          dart pub global activate fastforge
+          choco install innosetup
 
       - name: Add Chinese language file for Inno Setup
         run: |
-          if (Test-Path "windows/packaging/exe/ChineseSimplified.isl") {
-            Copy-Item "windows/packaging/exe/ChineseSimplified.isl" "C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl"
-          }
+          Copy-Item "windows/packaging/exe/ChineseSimplified.isl" "C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl"
         shell: pwsh
 
       - name: Set and Extract version
         shell: pwsh
         run: lib/scripts/build.ps1
 
-      # 构建 Windows ARM64 版本
-      - name: Build Windows (Native ARM64)
+      - name: Build Windows (arm64)
         run: |
-          flutter build windows --arch=arm64 --release --dart-define-from-file=pili_release.json
+          # 使用 fastforge 与 flutter 构建（如 fastforge 需要额外参数，可调整）
+          fastforge package --platform windows --targets exe --flutter-build-args="--arch=arm64 --dart-define-from-file=pili_release.json"
 
-      # 打包产物 (使用通配符修复路径问题)
-      - name: Package Artifacts
+      - name: Prepare Upload
         run: |
           mkdir -p Release/PiliPlus-Win
-          
-          # 使用 * 通配符，无视路径差异
-          Write-Host "Moving built files..."
-          Move-Item build/windows/*/runner/Release/* Release/PiliPlus-Win/ -Force
-          
-          Compress-Archive -Path "Release/PiliPlus-Win" -DestinationPath "PiliPlus_windows_arm64.zip"
+          mkdir -p PiliPlus-Win-Setup
+          # 复制 arm64 构建产物（兼容 build/windows/arm64 或 build/windows/runner 结构）
+          mv build/windows/arm64/runner/Release/* Release/PiliPlus-Win/ || true
+          mv build/windows/*/runner/Release/* Release/PiliPlus-Win/ || true
+          # fastforge/innosetup 产物（安装程序）
+          mv dist/**/*.exe PiliPlus-Win-Setup/PiliPlus_windows_${{env.version}}_arm64_setup.exe || true
+
+      - name: Compress
+        if: ${{ github.event.inputs.tag != '' }}
+        run: |
+          Compress-Archive -Path "Release/PiliPlus-Win" -DestinationPath "PiliPlus_windows_${{env.version}}_arm64.zip"
         shell: pwsh
 
-      # 上传 ZIP 包
-      - name: Upload Portable ZIP
-        uses: actions/upload-artifact@v4
+      - name: Release
+        if: ${{ github.event.inputs.tag != '' }}
+        uses: softprops/action-gh-release@v2
         with:
-          name: PiliPlus-Windows-ARM64-Portable
-          path: PiliPlus_windows_arm64.zip
+          tag_name: ${{ github.event.inputs.tag }}
+          name: ${{ github.event.inputs.tag }}
+          files: |
+            PiliPlus_windows_*.zip
+            PiliPlus-Win-Setup/PiliPlus_windows_*.exe
+
+      - name: Upload windows file release
+        uses: actions/upload-artifact@v5
+        with:
+          name: Windows-file-arm64-release
+          path: Release
+
+      - name: Upload windows setup release
+        uses: actions/upload-artifact@v5
+        with:
+          name: Windows-setup-arm64-release
+          path: PiliPlus-Win-Setup
