@@ -29,12 +29,18 @@ jobs:
       - name: Add fastforge and Inno Setup
         run: |
           dart pub global activate fastforge
-          choco install innosetup
+          choco install innosetup -y
         shell: pwsh
 
       - name: Add Chinese language file for Inno Setup
         run: |
-          Copy-Item "windows/packaging/exe/ChineseSimplified.isl" "C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl"
+          $target = 'C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl'
+          if (-not (Test-Path $target)) {
+            Copy-Item "windows/packaging/exe/ChineseSimplified.isl" $target -Force
+            Write-Host "Copied ChineseSimplified.isl to Inno Setup languages folder."
+          } else {
+            Write-Host "ChineseSimplified.isl already exists in target."
+          }
         shell: pwsh
 
       - name: Set and Extract version
@@ -47,17 +53,32 @@ jobs:
           fastforge package --platform windows --targets exe --flutter-build-args="--arch=arm64 --dart-define-from-file=pili_release.json"
         shell: pwsh
 
-      - name: Prepare Upload
+      - name: Debug - list key directories (for troubleshooting)
+        shell: pwsh
+        run: |
+          Write-Host "PWD: $(Get-Location)"
+          Write-Host "`n-- Listing top-level --"
+          Get-ChildItem -Force | Select-Object Name,Mode,Length,LastWriteTime | Format-Table -AutoSize
+          Write-Host "`n-- Listing build folder (if exists) --"
+          if (Test-Path build) { Get-ChildItem -Path build -Recurse -Force | Select-Object FullName | Out-String -Width 200 | Write-Host } else { Write-Host "No build/ folder" }
+          Write-Host "`n-- Listing dist folder (if exists) --"
+          if (Test-Path dist) { Get-ChildItem -Path dist -Recurse -Force | Select-Object FullName | Out-String -Width 200 | Write-Host } else { Write-Host "No dist/ folder" }
+          Write-Host "`n-- Listing windows folder (if exists) --"
+          if (Test-Path windows) { Get-ChildItem -Path windows -Recurse -Force | Select-Object FullName | Out-String -Width 200 | Write-Host } else { Write-Host "No windows/ folder" }
+      
+      - id: prepare
+        name: Prepare Upload (collect artifacts)
         shell: pwsh
         run: |
           # 创建目标目录（-Force 确保存在）
-          New-Item -ItemType Directory -Path "Release\PiliPlus-Win" -Force | Out-Null
-          New-Item -ItemType Directory -Path "PiliPlus-Win-Setup" -Force | Out-Null
+          $releaseDir = Join-Path $PWD "Release\PiliPlus-Win"
+          $setupDir = Join-Path $PWD "PiliPlus-Win-Setup"
+          New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $setupDir -Force | Out-Null
 
-          Write-Host "Looking for build artifact directories..."
+          Write-Host "Searching for app artifacts (common patterns)..."
 
-          # 尝试多种可能的构建��出路径并移动文件到 Release\PiliPlus-Win
-          $candidates = @(
+          $appPatterns = @(
             "build\windows\arm64\runner\Release\*",
             "build\windows\runner\Release\*",
             "build\windows\arm64\Release\*",
@@ -65,44 +86,89 @@ jobs:
           )
 
           $movedAny = $false
-          foreach ($pattern in $candidates) {
-            if (Test-Path $pattern) {
-              Write-Host "Found artifacts at: $pattern"
-              Get-ChildItem -Path $pattern -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-                $dest = Join-Path -Path (Resolve-Path "Release\PiliPlus-Win").Path -ChildPath $_.Name
-                Move-Item -Path $_.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
-                Write-Host "Moved: $($_.FullName) -> $dest"
+          foreach ($pattern in $appPatterns) {
+            Write-Host "Checking pattern: $pattern"
+            # Use Get-ChildItem with -ErrorAction SilentlyContinue to handle non-existent paths
+            $items = Get-ChildItem -Path $pattern -File -Recurse -ErrorAction SilentlyContinue
+            if ($items -and $items.Count -gt 0) {
+              foreach ($it in $items) {
+                $dest = Join-Path $releaseDir $it.Name
+                Move-Item -Path $it.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
+                Write-Host "Moved: $($it.FullName) -> $dest"
                 $movedAny = $true
               }
             } else {
-              Write-Host "Not found: $pattern"
+              Write-Host "No files matched for: $pattern"
             }
           }
 
+          # 如果没有在 build/* 找到，尝试查找可执行/库文件作为兜底（例如 fastforge 可能在 dist/）
           if (-not $movedAny) {
-            Write-Host "Warning: No build artifacts were found in expected paths. Continuing without failing the job."
+            Write-Host "Fallback: search common executable/library files under repo"
+            $fallback = Get-ChildItem -Path . -Include *.exe,*.dll,*.zip,*.appx -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\\.git\\\' }
+            if ($fallback -and $fallback.Count -gt 0) {
+              foreach ($f in $fallback) {
+                $dest = Join-Path $releaseDir $f.Name
+                Copy-Item -Path $f.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
+                Write-Host "Copied fallback: $($f.FullName) -> $dest"
+                $movedAny = $true
+              }
+            } else {
+              Write-Host "No fallback files found."
+            }
           }
 
-          # 查找 fastforge/innosetup 产物（安装程序 exe），并重命名移动到 PiliPlus-Win-Setup
+          # 查找 fastforge/innosetup 产物（安装程序）
+          Write-Host "Searching for installer (.exe) under dist/ and repo root..."
           $installer = Get-ChildItem -Path "dist" -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $installer) {
+            $installer = Get-ChildItem -Path . -Include *.exe -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\\.git\\\' } | Select-Object -First 1
+          }
+
           if ($installer) {
             $version = $env:version
             if (-not $version) { $version = "unknown" }
-            $destInstaller = Join-Path -Path (Resolve-Path "PiliPlus-Win-Setup").Path -ChildPath ("PiliPlus_windows_{0}_arm64_setup.exe" -f $version)
+            $destInstaller = Join-Path $setupDir ("PiliPlus_windows_{0}_arm64_setup.exe" -f $version)
             Move-Item -Path $installer.FullName -Destination $destInstaller -Force -ErrorAction SilentlyContinue
             Write-Host "Moved installer: $($installer.FullName) -> $destInstaller"
+            $movedSetup = $true
           } else {
-            Write-Host "No installer (.exe) found under dist/. Continuing without failing the job."
+            Write-Host "No installer (.exe) found."
+            $movedSetup = $false
+          }
+
+          # 输出目录内容以便审核
+          Write-Host "`n-- Release/PiliPlus-Win contents --"
+          Get-ChildItem -Path $releaseDir -Recurse -Force | Select-Object FullName,Length | Format-Table -AutoSize
+          Write-Host "`n-- PiliPlus-Win-Setup contents --"
+          Get-ChildItem -Path $setupDir -Recurse -Force | Select-Object FullName,Length | Format-Table -AutoSize
+
+          # 通过 GITHUB_OUTPUT 设置输出，供后续步骤判断是否继续压缩/发布
+          $hasArtifacts = $false
+          if ((Get-ChildItem -Path $releaseDir -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0 -or (Get-ChildItem -Path $setupDir -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0) {
+            $hasArtifacts = $true
+          }
+
+          if ($hasArtifacts) {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "has_artifacts=true"
+            Write-Host "has_artifacts=true"
+          } else {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "has_artifacts=false"
+            Write-Host "has_artifacts=false"
           }
 
       - name: Compress
-        if: ${{ github.event.inputs.tag != '' }}
-        run: |
-          Compress-Archive -Path "Release/PiliPlus-Win" -DestinationPath "PiliPlus_windows_${{env.version}}_arm64.zip" -Force
+        if: ${{ github.event.inputs.tag != '' && steps.prepare.outputs.has_artifacts == 'true' }}
         shell: pwsh
+        run: |
+          $version = $env:version
+          if (-not $version) { $version = "unknown" }
+          $zipPath = "PiliPlus_windows_${version}_arm64.zip"
+          Compress-Archive -Path "Release/PiliPlus-Win/*" -DestinationPath $zipPath -Force
+          Write-Host "Created $zipPath"
 
       - name: Release
-        if: ${{ github.event.inputs.tag != '' }}
+        if: ${{ github.event.inputs.tag != '' && steps.prepare.outputs.has_artifacts == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag }}
@@ -112,12 +178,14 @@ jobs:
             PiliPlus-Win-Setup/PiliPlus_windows_*.exe
 
       - name: Upload windows file release
+        if: ${{ steps.prepare.outputs.has_artifacts == 'true' }}
         uses: actions/upload-artifact@v5
         with:
           name: Windows-file-arm64-release
           path: Release
 
       - name: Upload windows setup release
+        if: ${{ steps.prepare.outputs.has_artifacts == 'true' }}
         uses: actions/upload-artifact@v5
         with:
           name: Windows-setup-arm64-release
