@@ -30,6 +30,7 @@ jobs:
         run: |
           dart pub global activate fastforge
           choco install innosetup
+        shell: pwsh
 
       - name: Add Chinese language file for Inno Setup
         run: |
@@ -44,21 +45,60 @@ jobs:
         run: |
           # 使用 fastforge 与 flutter 构建（如 fastforge 需要额外参数，可调整）
           fastforge package --platform windows --targets exe --flutter-build-args="--arch=arm64 --dart-define-from-file=pili_release.json"
+        shell: pwsh
 
       - name: Prepare Upload
+        shell: pwsh
         run: |
-          mkdir -p Release/PiliPlus-Win
-          mkdir -p PiliPlus-Win-Setup
-          # 复制 arm64 构建产物（兼容 build/windows/arm64 或 build/windows/runner 结构）
-          mv build/windows/arm64/runner/Release/* Release/PiliPlus-Win/ || true
-          mv build/windows/*/runner/Release/* Release/PiliPlus-Win/ || true
-          # fastforge/innosetup 产物（安装程序）
-          mv dist/**/*.exe PiliPlus-Win-Setup/PiliPlus_windows_${{env.version}}_arm64_setup.exe || true
+          # 创建目标目录（-Force 确保存在）
+          New-Item -ItemType Directory -Path "Release\PiliPlus-Win" -Force | Out-Null
+          New-Item -ItemType Directory -Path "PiliPlus-Win-Setup" -Force | Out-Null
+
+          Write-Host "Looking for build artifact directories..."
+
+          # 尝试多种可能的构建��出路径并移动文件到 Release\PiliPlus-Win
+          $candidates = @(
+            "build\windows\arm64\runner\Release\*",
+            "build\windows\runner\Release\*",
+            "build\windows\arm64\Release\*",
+            "build\windows\Release\*"
+          )
+
+          $movedAny = $false
+          foreach ($pattern in $candidates) {
+            if (Test-Path $pattern) {
+              Write-Host "Found artifacts at: $pattern"
+              Get-ChildItem -Path $pattern -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                $dest = Join-Path -Path (Resolve-Path "Release\PiliPlus-Win").Path -ChildPath $_.Name
+                Move-Item -Path $_.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
+                Write-Host "Moved: $($_.FullName) -> $dest"
+                $movedAny = $true
+              }
+            } else {
+              Write-Host "Not found: $pattern"
+            }
+          }
+
+          if (-not $movedAny) {
+            Write-Host "Warning: No build artifacts were found in expected paths. Continuing without failing the job."
+          }
+
+          # 查找 fastforge/innosetup 产物（安装程序 exe），并重命名移动到 PiliPlus-Win-Setup
+          $installer = Get-ChildItem -Path "dist" -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($installer) {
+            $version = $env:version
+            if (-not $version) { $version = "unknown" }
+            $destInstaller = Join-Path -Path (Resolve-Path "PiliPlus-Win-Setup").Path -ChildPath ("PiliPlus_windows_{0}_arm64_setup.exe" -f $version)
+            Move-Item -Path $installer.FullName -Destination $destInstaller -Force -ErrorAction SilentlyContinue
+            Write-Host "Moved installer: $($installer.FullName) -> $destInstaller"
+          } else {
+            Write-Host "No installer (.exe) found under dist/. Continuing without failing the job."
+          }
 
       - name: Compress
         if: ${{ github.event.inputs.tag != '' }}
         run: |
-          Compress-Archive -Path "Release/PiliPlus-Win" -DestinationPath "PiliPlus_windows_${{env.version}}_arm64.zip"
+          Compress-Archive -Path "Release/PiliPlus-Win" -DestinationPath "PiliPlus_windows_${{env.version}}_arm64.zip" -Force
         shell: pwsh
 
       - name: Release
