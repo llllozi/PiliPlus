@@ -9,7 +9,7 @@ on:
         default: ""
         type: string
       create_test_artifacts:
-        description: "If true, create small test artifacts when no real build artifacts found"
+        description: "If true, create small test artifacts for debugging"
         required: false
         default: false
         type: boolean
@@ -52,12 +52,14 @@ jobs:
           Write-Host "Using tag: $tag"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "release_tag=$tag"
 
-      - name: Build Windows (arm64)
+      - name: Build Windows (arm64) with fastforge (fixed args)
         shell: pwsh
         run: |
-          fastforge package --platform windows --targets exe --flutter-build-args="--arch=arm64 --dart-define-from-file=pili_release.json"
+          # NOTE: do NOT add leading dashes in flutter-build-args values.
+          # fastforge will add the `--` itself. Passing `--arch=arm64` caused `----arch`.
+          fastforge package --platform windows --targets exe --flutter-build-args="arch=arm64 --dart-define-from-file=pili_release.json"
 
-      - name: Debug - list dist and likely folders (for troubleshooting)
+      - name: Debug - list dist and windows folders
         shell: pwsh
         run: |
           Write-Host "PWD: $(Get-Location)"
@@ -75,11 +77,6 @@ jobs:
           } else {
             Write-Host "No windows/ folder"
           }
-          if (Test-Path build) {
-            Get-ChildItem -Path build -Recurse -Force | Select-Object FullName,Length,LastWriteTime | Out-String -Width 300 | Write-Host
-          } else {
-            Write-Host "No build/ folder"
-          }
 
       - id: prepare
         name: Prepare artifacts (collect everything from dist and common paths)
@@ -94,19 +91,16 @@ jobs:
           New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
           New-Item -ItemType Directory -Path $setupDir -Force | Out-Null
 
-          Write-Host "Collecting files from dist/ (all files) ..."
+          Write-Host "Copying all files from dist/ (if any)..."
           if (Test-Path dist) {
-            $distFiles = Get-ChildItem -Path dist -Recurse -File -ErrorAction SilentlyContinue
-            foreach ($f in $distFiles) {
-              $dest = Join-Path $releaseDir $f.Name
-              Copy-Item -Path $f.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
-              Write-Host "Copied from dist: $($f.FullName) -> $dest"
+            Get-ChildItem -Path dist -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+              $dest = Join-Path $releaseDir $_.Name
+              Copy-Item -Path $_.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
+              Write-Host "Copied from dist: $($_.FullName) -> $dest"
             }
-          } else {
-            Write-Host "dist/ not found"
           }
 
-          # Also collect from common windows output locations (if any)
+          # also copy from common windows output locations
           $otherPatterns = @(
             "build\windows\arm64\runner\Release\*",
             "build\windows\runner\Release\*",
@@ -114,50 +108,42 @@ jobs:
             "build\windows\Release\*",
             "windows\packaging\**\*"
           )
-
           foreach ($p in $otherPatterns) {
             Write-Host "Searching pattern: $p"
-            Try {
-              $items = Get-ChildItem -Path $p -File -Recurse -ErrorAction SilentlyContinue
-              if ($items) {
-                foreach ($it in $items) {
-                  $dest = Join-Path $releaseDir $it.Name
-                  Copy-Item -Path $it.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
-                  Write-Host "Copied: $($it.FullName) -> $dest"
-                }
-              } else {
-                Write-Host "No files matched $p"
+            $items = Get-ChildItem -Path $p -File -Recurse -ErrorAction SilentlyContinue
+            if ($items) {
+              foreach ($it in $items) {
+                $dest = Join-Path $releaseDir $it.Name
+                Copy-Item -Path $it.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
+                Write-Host "Copied: $($it.FullName) -> $dest"
               }
-            } Catch {
-              Write-Host "Pattern $p skipped (no files)"
+            } else {
+              Write-Host "No files matched $p"
             }
           }
 
-          # search whole repo as last resort for common artifact extensions and copy them
-          Write-Host "Fallback search (common extensions: exe, msi, msix, zip, appx)..."
+          # fallback: search common installer/archive extensions in repo
           $exts = @('*.exe','*.msi','*.msix','*.zip','*.appx','*.msixbundle','*.nupkg')
           foreach ($ext in $exts) {
-            $found = Get-ChildItem -Path . -Include $ext -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\.git\\' }
-            foreach ($f in $found) {
-              $dest = Join-Path $releaseDir $f.Name
-              Copy-Item -Path $f.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
-              Write-Host "Copied fallback: $($f.FullName) -> $dest"
+            Get-ChildItem -Path . -Include $ext -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\.git\\' } | ForEach-Object {
+              $dest = Join-Path $releaseDir $_.Name
+              Copy-Item -Path $_.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
+              Write-Host "Copied fallback: $($_.FullName) -> $dest"
             }
           }
 
-          # If nothing found and test switch enabled, create test files
+          # test artifact creation (if requested)
           $releaseFiles = Get-ChildItem -Path $releaseDir -Recurse -File -ErrorAction SilentlyContinue
           $installerCandidate = Get-ChildItem -Path $setupDir -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-
           if ((-not $releaseFiles -or $releaseFiles.Count -eq 0) -and (-not $installerCandidate) -and $env:CREATE_TEST_ARTIFACTS -eq 'true') {
-            Write-Host "No real artifacts found - creating small test artifacts..."
+            Write-Host "No artifacts found: creating test artifacts..."
             "test artifact" | Out-File -FilePath (Join-Path $releaseDir "test-file.txt") -Encoding utf8
-            $installerPath = Join-Path $setupDir ("PiliPlus_windows_${env:RELEASE_TAG}_test_setup.exe")
-            "dummy installer content" | Out-File -FilePath $installerPath -Encoding ascii
-            Write-Host "Test artifacts created: $installerPath"
+            $testInstaller = Join-Path $setupDir ("PiliPlus_windows_${env:RELEASE_TAG}_test_setup.exe")
+            "dummy installer content" | Out-File -FilePath $testInstaller -Encoding ascii
+            Write-Host "Test artifacts created."
           }
 
-          # Create a zip of everything inside Release\PiliPlus-Win (if any)
+          # create zip if releaseDir contains files
           $finalZip = ""
           $releaseTag = $env:RELEASE_TAG
           if (-not $releaseTag) { $releaseTag = "auto-${{ github.run_id }}" }
@@ -169,7 +155,7 @@ jobs:
             Write-Host "No files in $releaseDir to zip."
           }
 
-          # find any installer-like file under setup dir or repo
+          # find installer candidate
           $installer = Get-ChildItem -Path $setupDir -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $installer) {
             $installer = Get-ChildItem -Path dist -Include *.exe,*.msi,*.msix -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -197,11 +183,7 @@ jobs:
           Add-Content -Path $env:GITHUB_OUTPUT -Value "release_zip=$finalZip"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "release_installer=$installerPath"
 
-          Write-Host "outputs -> has_artifacts=$hasArtifacts, has_zip=$hasZip, has_installer=$hasInstaller"
-          Write-Host "release_zip=$finalZip"
-          Write-Host "release_installer=$installerPath"
-
-      - name: Upload zip artifact (actions artifact, visible on Run page)
+      - name: Upload zip artifact (actions artifact)
         if: ${{ steps.prepare.outputs.has_zip == 'true' }}
         uses: actions/upload-artifact@v5
         with:
