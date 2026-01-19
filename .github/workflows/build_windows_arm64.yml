@@ -1,16 +1,6 @@
 name: Build for Windows arm64
 
-permissions:
-  contents: write
-
 on:
-  workflow_call:
-    inputs:
-      tag:
-        description: "tag"
-        required: false
-        default: ""
-        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -19,14 +9,14 @@ on:
         default: ""
         type: string
       create_test_artifacts:
-        description: "Create test artifacts when real artifacts are not found (for debugging)"
+        description: "If true, create small test artifacts when no real build artifacts found"
         required: false
         default: false
         type: boolean
 
 jobs:
   build-windows-app-arm64:
-    name: Release Windows arm64
+    name: Build and upload artifacts (Windows arm64)
     runs-on: windows-latest
     steps:
       - name: Checkout code
@@ -41,21 +31,21 @@ jobs:
           flutter-version-file: pubspec.yaml
 
       - name: Add fastforge and Inno Setup
+        shell: pwsh
         run: |
           dart pub global activate fastforge
           choco install innosetup -y
-        shell: pwsh
 
       - name: Add Chinese language file for Inno Setup
+        shell: pwsh
         run: |
           $target = 'C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl'
           if (-not (Test-Path $target)) {
             Copy-Item "windows/packaging/exe/ChineseSimplified.isl" $target -Force
-            Write-Host "Copied ChineseSimplified.isl to Inno Setup languages folder."
+            Write-Host "Copied ChineseSimplified.isl"
           } else {
-            Write-Host "ChineseSimplified.isl already exists."
+            Write-Host "ChineseSimplified.isl exists"
           }
-        shell: pwsh
 
       - name: Set and Extract version
         shell: pwsh
@@ -67,132 +57,117 @@ jobs:
         run: |
           $inputTag = '${{ github.event.inputs.tag }}'
           $envVersion = $env:version
-          if ($inputTag -and $inputTag -ne '') {
-            $tag = $inputTag
-          } elseif ($envVersion -and $envVersion -ne '') {
-            $tag = "v$envVersion"
-          } else {
-            $tag = "auto-${{ github.run_id }}"
-          }
+          if ($inputTag -and $inputTag -ne '') { $tag = $inputTag }
+          elseif ($envVersion -and $envVersion -ne '') { $tag = "v$envVersion" }
+          else { $tag = "auto-${{ github.run_id }}" }
           Write-Host "Using tag: $tag"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "release_tag=$tag"
 
       - name: Build Windows (arm64)
+        shell: pwsh
         run: |
           fastforge package --platform windows --targets exe --flutter-build-args="--arch=arm64 --dart-define-from-file=pili_release.json"
-        shell: pwsh
 
-      - name: Debug - list key directories (for troubleshooting)
+      - name: Debug - list likely output folders
         shell: pwsh
         run: |
           Write-Host "PWD: $(Get-Location)"
-          Write-Host "`n-- top-level --"
-          Get-ChildItem -Force | Select-Object Name,Mode,Length,LastWriteTime | Format-Table -AutoSize
+          Write-Host "`n-- Top-level --"
+          Get-ChildItem -Force | Select Name,Mode,Length,LastWriteTime | Format-Table -AutoSize
           Write-Host "`n-- build/ --"
           if (Test-Path build) { Get-ChildItem -Path build -Recurse -Force | Select-Object FullName | Out-String -Width 200 | Write-Host } else { Write-Host "No build/ folder" }
           Write-Host "`n-- dist/ --"
           if (Test-Path dist) { Get-ChildItem -Path dist -Recurse -Force | Select-Object FullName | Out-String -Width 200 | Write-Host } else { Write-Host "No dist/ folder" }
 
       - id: prepare
-        name: Prepare Upload (collect artifacts, create zip)
+        name: Prepare artifacts (zip + installer) and set outputs
         shell: pwsh
         env:
           CREATE_TEST_ARTIFACTS: ${{ github.event.inputs.create_test_artifacts }}
-          RELEASE_TAG: ${{ steps.set_tag.outputs.release_tag }}
         run: |
           $releaseDir = Join-Path $PWD "Release\PiliPlus-Win"
-          $setupDir = Join-Path $PWD "PiliPlus-Win-Setup"
+          $setupDir   = Join-Path $PWD "PiliPlus-Win-Setup"
           New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
           New-Item -ItemType Directory -Path $setupDir -Force | Out-Null
 
-          Write-Host "Searching for app artifacts (common patterns)..."
-          $appPatterns = @(
+          $patterns = @(
             "build\windows\arm64\runner\Release\*",
             "build\windows\runner\Release\*",
             "build\windows\arm64\Release\*",
             "build\windows\Release\*"
           )
 
-          $movedAny = $false
-          foreach ($pattern in $appPatterns) {
-            Write-Host "Checking pattern: $pattern"
-            $items = Get-ChildItem -Path $pattern -File -Recurse -ErrorAction SilentlyContinue
+          $foundApp = $false
+          foreach ($p in $patterns) {
+            Write-Host "Checking: $p"
+            $items = Get-ChildItem -Path $p -File -Recurse -ErrorAction SilentlyContinue
             if ($items -and $items.Count -gt 0) {
               foreach ($it in $items) {
                 $dest = Join-Path $releaseDir $it.Name
                 Move-Item -Path $it.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
                 Write-Host "Moved: $($it.FullName) -> $dest"
-                $movedAny = $true
+                $foundApp = $true
               }
             } else {
-              Write-Host "No files matched for: $pattern"
+              Write-Host "No match for: $p"
             }
           }
 
-          if (-not $movedAny) {
-            Write-Host "Fallback search for .exe/.dll/.zip in repo..."
-            $fallback = Get-ChildItem -Path . -Include *.exe,*.dll,*.zip,*.appx -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\\.git\\\' }
+          if (-not $foundApp) {
+            Write-Host "Fallback search for common artifacts (.exe,.dll,.zip,.appx)"
+            $fallback = Get-ChildItem -Path . -Include *.exe,*.dll,*.zip,*.appx -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\.git\\' }
             if ($fallback -and $fallback.Count -gt 0) {
               foreach ($f in $fallback) {
                 $dest = Join-Path $releaseDir $f.Name
                 Copy-Item -Path $f.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
                 Write-Host "Copied fallback: $($f.FullName) -> $dest"
-                $movedAny = $true
+                $foundApp = $true
               }
             } else {
-              Write-Host "No fallback files found."
+              Write-Host "No fallback artifacts found."
             }
           }
 
-          Write-Host "Searching for installer (.exe) under dist/ and repo root..."
-          $installer = Get-ChildItem -Path "dist" -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          # Installer search (dist first then whole repo)
+          $installer = Get-ChildItem -Path "dist" -Filter *.exe -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $installer) {
-            $installer = Get-ChildItem -Path . -Include *.exe -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\\.git\\\' } | Select-Object -First 1
+            $installer = Get-ChildItem -Path . -Include *.exe -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\.git\\' } | Select-Object -First 1
           }
 
-          $movedSetup = $false
-          $installerPath = ''
+          $haveInstaller = $false
+          $installerPath = ""
           if ($installer) {
-            $version = $env:version
-            if (-not $version) { $version = "unknown" }
-            $destInstaller = Join-Path $setupDir ("PiliPlus_windows_{0}_arm64_setup.exe" -f $version)
-            Move-Item -Path $installer.FullName -Destination $destInstaller -Force -ErrorAction SilentlyContinue
-            Write-Host "Moved installer: $($installer.FullName) -> $destInstaller"
-            $movedSetup = $true
-            $installerPath = $destInstaller
+            $ver = $env:version
+            if (-not $ver) { $ver = "unknown" }
+            $installerPath = Join-Path $setupDir ("PiliPlus_windows_${ver}_arm64_setup.exe")
+            Move-Item -Path $installer.FullName -Destination $installerPath -Force -ErrorAction SilentlyContinue
+            Write-Host "Moved installer: $($installer.FullName) -> $installerPath"
+            $haveInstaller = $true
           } else {
-            Write-Host "No installer (.exe) found."
+            Write-Host "No installer found"
           }
 
-          # If no real artifacts and user requested test artifacts, create them to verify release flow
-          if (-not $movedAny -and -not $movedSetup -and $env:CREATE_TEST_ARTIFACTS -eq 'true') {
-            Write-Host "CREATE_TEST_ARTIFACTS is true -> creating test artifacts for verification..."
-            $testFile = Join-Path $releaseDir "test-file.txt"
-            "this is a test artifact" | Out-File -FilePath $testFile -Encoding utf8
-            $zipPath = Join-Path $PWD ("PiliPlus_windows_${env:RELEASE_TAG}_arm64.zip")
-            Compress-Archive -Path "$releaseDir\*" -DestinationPath $zipPath -Force
-            Write-Host "Created test zip: $zipPath"
-
-            $testInstaller = Join-Path $setupDir "PiliPlus_windows_${env:RELEASE_TAG}_arm64_setup.exe"
-            "dummy installer content" | Out-File -FilePath $testInstaller -Encoding ascii
-            Write-Host "Created test installer: $testInstaller"
-
-            $movedAny = $true
-            $movedSetup = $true
-            $installerPath = $testInstaller
+          # If nothing found and user requested test artifacts, create small test files so we can verify artifact upload
+          if (-not $foundApp -and -not $haveInstaller -and $env:CREATE_TEST_ARTIFACTS -eq 'true') {
+            Write-Host "Creating test artifacts..."
+            "test artifact file" | Out-File -FilePath (Join-Path $releaseDir "test-file.txt") -Encoding utf8
+            $installerPath = Join-Path $setupDir "PiliPlus_windows_test_arm64_setup.exe"
+            "dummy installer content" | Out-File -FilePath $installerPath -Encoding ascii
+            $foundApp = $true
+            $haveInstaller = $true
+            Write-Host "Test artifacts created."
           }
 
-          # Create zip from Release\PiliPlus-Win if any files exist and name it using release tag
-          $zipPath = ''
-          $releaseTag = $env:RELEASE_TAG
+          # Create zip from Release/PiliPlus-Win if it contains files
+          $zipPath = ""
+          $releaseTag = "${{ steps.set_tag.outputs.release_tag }}"
           if ((Get-ChildItem -Path $releaseDir -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0) {
             if (-not $releaseTag) { $releaseTag = "auto-${{ github.run_id }}" }
             $zipPath = Join-Path $PWD ("PiliPlus_windows_${releaseTag}_arm64.zip")
-            # include files inside the folder
             Compress-Archive -Path "$releaseDir\*" -DestinationPath $zipPath -Force
-            Write-Host "Created zip: $zipPath"
+            Write-Host "Zip created: $zipPath"
           } else {
-            Write-Host "No files in $releaseDir to zip."
+            Write-Host "No files to zip in $releaseDir"
           }
 
           Write-Host "`n-- Release/PiliPlus-Win contents --"
@@ -200,69 +175,37 @@ jobs:
           Write-Host "`n-- PiliPlus-Win-Setup contents --"
           Get-ChildItem -Path $setupDir -Recurse -Force | Select-Object FullName,Length | Format-Table -AutoSize
 
-          $hasZip = $false
-          if ($zipPath -and (Test-Path $zipPath)) { $hasZip = $true }
-          $hasInstaller = $false
-          if ($installerPath -and (Test-Path $installerPath)) { $hasInstaller = $true }
-
+          $hasZip = ($zipPath -ne "" -and (Test-Path $zipPath))
+          $hasInstaller = ($installerPath -ne "" -and (Test-Path $installerPath))
           $hasArtifacts = $hasZip -or $hasInstaller
 
-          # Export outputs for later steps
           Add-Content -Path $env:GITHUB_OUTPUT -Value "has_artifacts=$($hasArtifacts.ToString().ToLower())"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "has_zip=$($hasZip.ToString().ToLower())"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "has_installer=$($hasInstaller.ToString().ToLower())"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "release_zip=$zipPath"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "release_installer=$installerPath"
-          Write-Host "has_artifacts=$hasArtifacts"
-          Write-Host "has_zip=$hasZip"
-          Write-Host "has_installer=$hasInstaller"
+
+          Write-Host "outputs: has_artifacts=$hasArtifacts, has_zip=$hasZip, has_installer=$hasInstaller"
           Write-Host "release_zip=$zipPath"
           Write-Host "release_installer=$installerPath"
 
-      - name: Create GitHub Release (if artifacts exist)
-        if: ${{ steps.prepare.outputs.has_artifacts == 'true' }}
-        id: create_release
-        uses: actions/create-release@v1
+      - name: Upload release zip as Actions artifact
+        if: ${{ steps.prepare.outputs.has_zip == 'true' }}
+        uses: actions/upload-artifact@v5
         with:
-          tag_name: ${{ steps.set_tag.outputs.release_tag }}
-          release_name: ${{ steps.set_tag.outputs.release_tag }}
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: windows-arm64-release
+          path: ${{ steps.prepare.outputs.release_zip }}
 
-      - name: Upload zip to Release (if exists)
-        if: ${{ steps.prepare.outputs.has_zip == 'true' && steps.prepare.outputs.has_artifacts == 'true' }}
-        uses: actions/upload-release-asset@v1
+      - name: Upload installer as Actions artifact
+        if: ${{ steps.prepare.outputs.has_installer == 'true' }}
+        uses: actions/upload-artifact@v5
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ${{ steps.prepare.outputs.release_zip }}
-          asset_name: ${{ steps.prepare.outputs.release_zip }}
-          asset_content_type: application/zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: windows-setup-arm64-release
+          path: ${{ steps.prepare.outputs.release_installer }}
 
-      - name: Upload installer to Release (if exists)
-        if: ${{ steps.prepare.outputs.has_installer == 'true' && steps.prepare.outputs.has_artifacts == 'true' }}
-        uses: actions/upload-release-asset@v1
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ${{ steps.prepare.outputs.release_installer }}
-          asset_name: ${{ steps.prepare.outputs.release_installer }}
-          asset_content_type: application/octet-stream
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload windows file release (Actions artifact)
+      - name: Upload whole Release folder (optional)
         if: ${{ steps.prepare.outputs.has_artifacts == 'true' }}
         uses: actions/upload-artifact@v5
         with:
-          name: Windows-file-arm64-release
+          name: Release-folder
           path: Release
-
-      - name: Upload windows setup release (Actions artifact)
-        if: ${{ steps.prepare.outputs.has_artifacts == 'true' }}
-        uses: actions/upload-artifact@v5
-        with:
-          name: Windows-setup-arm64-release
-          path: PiliPlus-Win-Setup
