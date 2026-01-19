@@ -1,13 +1,6 @@
 name: Build for Windows arm64
 
 on:
-  workflow_call:
-    inputs:
-      tag:
-        description: "tag"
-        required: false
-        default: ""
-        type: string
   workflow_dispatch:
 
 jobs:
@@ -26,57 +19,27 @@ jobs:
           channel: stable
           flutter-version-file: pubspec.yaml
 
-      - name: Add fastforge and Inno Setup
-        run: |
-          dart pub global activate fastforge
-          choco install innosetup
+      - name: Install dependencies
+        run: flutter pub get
 
-      - name: Add Chinese language file for Inno Setup
-        run: |
-          Copy-Item "windows/packaging/exe/ChineseSimplified.isl" "C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl"
-        shell: pwsh
-
-      - name: Set and Extract version
+      - name: Set Version
         shell: pwsh
         run: lib/scripts/build.ps1
 
-      - name: Build Windows
-        run: |
-          # 这里保留了 --arch=arm64 参数
-          fastforge package --platform windows --targets exe --flutter-build-args="dart-define-from-file=pili_release.json --arch=arm64"
+      - name: Build Windows (Standard)
+        # 直接调用 flutter 官方命令，不再经过 fastforge 包装
+        # 如果报错提示找不到 pili_release.json，请删除 --dart-define... 那一段参数
+        run: flutter build windows --arch=arm64 --release --dart-define-from-file=pili_release.json
 
-      - name: Prepare Upload
+      - name: Prepare Artifacts
         run: |
           mkdir -p Release/PiliPlus-Win
-          mkdir -p PiliPlus-Win-Setup
-          # 【修复点】使用 * 通配符，自动匹配 x64 或 arm64 文件夹，解决路径报错
+          # 使用原生命令后，文件一定会出现在这里
+          # 使用通配符 * 匹配 arm64 或 runner 目录，确保万无一失
           mv build/windows/*/runner/Release/* Release/PiliPlus-Win/
-          mv dist/**/*.exe PiliPlus-Win-Setup/PiliPlus_windows_${{env.version}}_arm64_setup.exe
 
-      - name: Compress
-        if: ${{ github.event.inputs.tag != '' }}
-        run: |
-          Compress-Archive -Path "Release/PiliPlus-Win" -DestinationPath "PiliPlus_windows_${{env.version}}_arm64.zip"
-        shell: pwsh
-
-      - name: Release
-        if: ${{ github.event.inputs.tag != '' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.tag }}
-          name: ${{ github.event.inputs.tag }}
-          files: |
-            PiliPlus_windows_*.zip
-            PiliPlus-Win-Setup/PiliPlus_windows_*.exe
-
-      - name: Upload windows file release
+      - name: Upload Portable Zip
         uses: actions/upload-artifact@v5
         with:
-          name: Windows-file-arm64-release
-          path: Release
-
-      - name: Upload windows setup release
-        uses: actions/upload-artifact@v5
-        with:
-          name: Windows-setup-arm64-release
-          path: PiliPlus-Win-Setup
+          name: PiliPlus-Windows-arm64
+          path: Release/PiliPlus-Win
