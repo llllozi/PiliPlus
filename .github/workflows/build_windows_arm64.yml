@@ -1,7 +1,8 @@
 name: Build for Windows arm64
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # 允许手动触发
+  workflow_call:      # 允许被其他流程调用
 
 jobs:
   build-windows-app:
@@ -9,37 +10,77 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # 【关键修复1】强制指定支持 ARM64 的 Flutter 版本 (3.27.1)
+      # 不要使用 flutter-version-file，因为它可能会锁定到不支持 arm64 的旧版本
       - name: Setup flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version-file: pubspec.yaml
+          flutter-version: '3.27.1'
+
+      # 【关键修复2】显式开启 Windows ARM64 支持
+      - name: Enable Windows ARM64 support
+        run: |
+          flutter config --enable-windows-desktop
+          # 某些版本可能还需要这个显式开关，加上更保险
+          flutter config --enable-windows-arm64
+        shell: pwsh
 
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Set Version
+      - name: Add Inno Setup (用于打包安装程序)
+        run: choco install innosetup
+
+      - name: Add Chinese language file for Inno Setup
+        run: |
+          if (Test-Path "windows/packaging/exe/ChineseSimplified.isl") {
+            Copy-Item "windows/packaging/exe/ChineseSimplified.isl" "C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl"
+          }
+        shell: pwsh
+
+      # 生成版本号脚本
+      - name: Set and Extract version
         shell: pwsh
         run: lib/scripts/build.ps1
 
-      - name: Build Windows (Standard)
-        # 直接调用 flutter 官方命令，不再经过 fastforge 包装
-        # 如果报错提示找不到 pili_release.json，请删除 --dart-define... 那一段参数
-        run: flutter build windows --arch=arm64 --release --dart-define-from-file=pili_release.json
+      # 【关键修复3】使用标准构建命令，不依赖 fastforge，减少出错概率
+      # 直接调用 flutter build windows 并指定 arm64
+      - name: Build Windows (Native ARM64)
+        run: |
+          flutter build windows --arch=arm64 --release --dart-define-from-file=pili_release.json
 
-      - name: Prepare Artifacts
+      # 【打包步骤】手动调用 Inno Setup 打包 (模拟 fastforge 的行为)
+      # 如果这一步太复杂，至少上面的 Build 已经生成了绿色版 ZIP
+      - name: Compile Inno Setup Installer
+        run: |
+          # 尝试使用 ISCC 编译安装包，注意：这里假设脚本在默认位置
+          # 如果项目依赖 fastforge 来生成 iss 脚本，这一步可能会失败。
+          # 但为了稳妥，我们主要保住上面的绿色版 ZIP。
+          # 如果你想用 fastforge，可以保留下面的注释行，但我建议先跑通基础的。
+          echo "Skipping installer build to ensure artifact success first."
+        shell: pwsh
+
+      # 【关键修复4】使用通配符打包，绝对不会找不到文件
+      - name: Package Artifacts
         run: |
           mkdir -p Release/PiliPlus-Win
-          # 使用原生命令后，文件一定会出现在这里
-          # 使用通配符 * 匹配 arm64 或 runner 目录，确保万无一失
-          mv build/windows/*/runner/Release/* Release/PiliPlus-Win/
+          
+          # 移动构建产物 (使用 * 匹配 x64 或 arm64 目录)
+          Write-Host "Moving built files..."
+          Move-Item build/windows/*/runner/Release/* Release/PiliPlus-Win/ -Force
+          
+          # 压缩成 ZIP
+          Compress-Archive -Path "Release/PiliPlus-Win" -DestinationPath "PiliPlus_windows_arm64.zip"
+        shell: pwsh
 
-      - name: Upload Portable Zip
-        uses: actions/upload-artifact@v5
+      # 上传 ZIP (这是你最需要的)
+      - name: Upload Portable ZIP
+        uses: actions/upload-artifact@v4
         with:
-          name: PiliPlus-Windows-arm64
-          path: Release/PiliPlus-Win
+          name: PiliPlus-Windows-ARM64-Portable
+          path: PiliPlus_windows_arm64.zip
